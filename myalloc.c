@@ -101,7 +101,28 @@ static block_t *find_fit(size_t need)
     return NULL;
 }
 
-/* ---- Task 3: my_malloc with first-fit ---- */
+/* split_block(): if b is large enough, carve `need` off the front and
+ * leave a free remainder of the rest. No-op if remainder < HDR+16. */
+static void split_block(block_t *b, size_t need)
+{
+    if (b->size - need < MIN_SPLIT)
+        return;
+
+    block_t *rest = (block_t *)((char *)payload(b) + need);
+    rest->size  = b->size - need - HDR;
+    rest->next  = b->next;
+    rest->free  = 1;
+    rest->magic = MAGIC;
+    rest->pad   = 0;
+
+    b->size = need;
+    b->next = rest;
+
+    if (g_tail == b)
+        g_tail = rest;
+}
+
+/* ---- Task 3+4: my_malloc with first-fit and splitting ---- */
 
 void *my_malloc(size_t size)
 {
@@ -120,6 +141,7 @@ void *my_malloc(size_t size)
     }
 
     b->free = 0;
+    split_block(b, need);
     return payload(b);
 }
 
