@@ -51,15 +51,6 @@ static void write_str(const char *s)
     (void)r;
 }
 
-/*
- * validate_ptr(): check that ptr is a plausible user pointer that
- * points at the payload of an allocated (not free) block of ours.
- * On success returns the block and prints nothing.
- * On failure prints an appropriate message and returns NULL.
- *
- * The `quiet` flag suppresses printing — used by my_realloc, which
- * returns NULL silently on bad pointers per the standard.
- */
 static block_t *validate_ptr(void *ptr, int quiet)
 {
     if (g_heap_start == NULL) {
@@ -86,7 +77,6 @@ static block_t *validate_ptr(void *ptr, int quiet)
     return b;
 }
 
-/* grow(): obtain memory from sbrk, append one new free block. */
 static block_t *grow(size_t need)
 {
     if (need > (size_t)PTRDIFF_MAX - HDR - MIN_CHUNK - 16u)
@@ -217,14 +207,73 @@ void my_free(void *ptr)
 
 void *my_calloc(size_t nmemb, size_t size)
 {
-    (void)nmemb; (void)size;
-    return NULL;
+    if (nmemb == 0 || size == 0)
+        return NULL;
+    if (nmemb > SIZE_MAX / size)
+        return NULL;
+
+    size_t total = nmemb * size;
+    void *p = my_malloc(total);
+    if (p == NULL)
+        return NULL;
+    memset(p, 0, total);
+    return p;
 }
 
 void *my_realloc(void *ptr, size_t size)
 {
-    (void)ptr; (void)size;
-    return NULL;
+    if (ptr == NULL)
+        return my_malloc(size);
+
+    if (size == 0) {
+        my_free(ptr);
+        return NULL;
+    }
+
+    if (size > SIZE_MAX - 15u)
+        return NULL;                    /* leave old block untouched */
+
+    block_t *b = validate_ptr(ptr, 1);  /* quiet: standard says NULL on bad ptr */
+    if (b == NULL)
+        return NULL;
+
+    size_t need = align_up(size);
+
+    /* Case A: fits in place */
+    if (b->size >= need) {
+        split_block(b, need);
+        coalesce_all();                 /* merge any newly adjacent free blocks */
+        return ptr;
+    }
+
+    /* Case B: next block is free, adjacent, big enough */
+    if (b->next != NULL
+        && b->next->free
+        && (char *)payload(b) + b->size == (char *)b->next
+        && b->size + HDR + b->next->size >= need)
+    {
+        block_t *n = b->next;
+        b->size += HDR + n->size;
+        b->next  = n->next;
+        n->magic = 0;
+        n->size  = 0;
+        n->next  = NULL;
+        n->free  = 0;
+        if (g_tail == n)
+            g_tail = b;
+        split_block(b, need);
+        coalesce_all();
+        return ptr;
+    }
+
+    /* Case C: allocate new, copy, free old */
+    void *np = my_malloc(size);
+    if (np == NULL)
+        return NULL;
+    size_t copy = b->size;              /* b->size < size, so copy all of it */
+    memcpy(np, ptr, copy);
+    my_free(ptr);
+    return np;
 }
 
 void heap_stats(heap_stats_t *out)
