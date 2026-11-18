@@ -124,13 +124,26 @@ static block_t *grow(size_t need)
     return b;
 }
 
+/* find_fit(): first-fit or best-fit depending on g_policy. */
 static block_t *find_fit(size_t need)
 {
-    for (block_t *b = g_head; b != NULL; b = b->next) {
-        if (b->free && b->size >= need)
-            return b;
+    if (g_policy == FIT_FIRST) {
+        for (block_t *b = g_head; b != NULL; b = b->next) {
+            if (b->free && b->size >= need)
+                return b;
+        }
+        return NULL;
     }
-    return NULL;
+
+    /* FIT_BEST: smallest free block that fits; ties go to earlier block. */
+    block_t *best = NULL;
+    for (block_t *b = g_head; b != NULL; b = b->next) {
+        if (b->free && b->size >= need) {
+            if (best == NULL || b->size < best->size)
+                best = b;
+        }
+    }
+    return best;
 }
 
 static void split_block(block_t *b, size_t need)
@@ -231,22 +244,20 @@ void *my_realloc(void *ptr, size_t size)
     }
 
     if (size > SIZE_MAX - 15u)
-        return NULL;                    /* leave old block untouched */
+        return NULL;
 
-    block_t *b = validate_ptr(ptr, 1);  /* quiet: standard says NULL on bad ptr */
+    block_t *b = validate_ptr(ptr, 1);
     if (b == NULL)
         return NULL;
 
     size_t need = align_up(size);
 
-    /* Case A: fits in place */
     if (b->size >= need) {
         split_block(b, need);
-        coalesce_all();                 /* merge any newly adjacent free blocks */
+        coalesce_all();
         return ptr;
     }
 
-    /* Case B: next block is free, adjacent, big enough */
     if (b->next != NULL
         && b->next->free
         && (char *)payload(b) + b->size == (char *)b->next
@@ -266,11 +277,10 @@ void *my_realloc(void *ptr, size_t size)
         return ptr;
     }
 
-    /* Case C: allocate new, copy, free old */
     void *np = my_malloc(size);
     if (np == NULL)
         return NULL;
-    size_t copy = b->size;              /* b->size < size, so copy all of it */
+    size_t copy = b->size;
     memcpy(np, ptr, copy);
     my_free(ptr);
     return np;
@@ -305,13 +315,12 @@ void heap_stats(heap_stats_t *out)
 
 void heap_dump(void)
 {
-    /* populated in Task 7 */
+    /* populated in Task 7b */
 }
 
 void set_policy(fit_policy_t p)
 {
     g_policy = p;
-    (void)g_policy;
 }
 
 int heap_check(void)
