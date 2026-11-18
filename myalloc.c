@@ -101,8 +101,7 @@ static block_t *find_fit(size_t need)
     return NULL;
 }
 
-/* split_block(): if b is large enough, carve `need` off the front and
- * leave a free remainder of the rest. No-op if remainder < HDR+16. */
+/* split_block(): carve `need` off the front of b, leave free remainder. */
 static void split_block(block_t *b, size_t need)
 {
     if (b->size - need < MIN_SPLIT)
@@ -122,8 +121,7 @@ static void split_block(block_t *b, size_t need)
         g_tail = rest;
 }
 
-/* ---- Task 3+4: my_malloc with first-fit and splitting ---- */
-
+/* my_malloc: first-fit with splitting. */
 void *my_malloc(size_t size)
 {
     if (size == 0)
@@ -145,14 +143,10 @@ void *my_malloc(size_t size)
     return payload(b);
 }
 
-/* ---- Tasks 5-7 stubs ---- */
-
+/* my_free: bounds check, magic check, mark free, coalesce. */
 void my_free(void *ptr)
 {
-    if (ptr == NULL)
-        return;
-    block_t *b = header(ptr);
-    (void)b;
+    (void)ptr;
 }
 
 void *my_calloc(size_t nmemb, size_t size)
@@ -167,16 +161,32 @@ void *my_realloc(void *ptr, size_t size)
     return NULL;
 }
 
+/* heap_stats: real numbers from a list walk. */
 void heap_stats(heap_stats_t *out)
 {
     if (out == NULL)
         return;
+
+    size_t used = 0, fr = 0, blocks = 0, free_blocks = 0, largest = 0;
+
+    for (block_t *b = g_head; b != NULL; b = b->next) {
+        blocks++;
+        if (b->free) {
+            free_blocks++;
+            fr += b->size;
+            if (b->size > largest)
+                largest = b->size;
+        } else {
+            used += b->size;
+        }
+    }
+
     out->heap_bytes   = g_heap_bytes;
-    out->used_bytes   = 0;
-    out->free_bytes   = 0;
-    out->blocks       = 0;
-    out->free_blocks  = 0;
-    out->largest_free = 0;
+    out->used_bytes   = used;
+    out->free_bytes   = fr;
+    out->blocks       = blocks;
+    out->free_blocks  = free_blocks;
+    out->largest_free = largest;
 }
 
 void heap_dump(void)
