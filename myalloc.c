@@ -51,6 +51,41 @@ static void write_str(const char *s)
     (void)r;
 }
 
+/*
+ * validate_ptr(): check that ptr is a plausible user pointer that
+ * points at the payload of an allocated (not free) block of ours.
+ * On success returns the block and prints nothing.
+ * On failure prints an appropriate message and returns NULL.
+ *
+ * The `quiet` flag suppresses printing — used by my_realloc, which
+ * returns NULL silently on bad pointers per the standard.
+ */
+static block_t *validate_ptr(void *ptr, int quiet)
+{
+    if (g_heap_start == NULL) {
+        if (!quiet) write_str("my_free: invalid pointer\n");
+        return NULL;
+    }
+
+    uintptr_t p  = (uintptr_t)ptr;
+    uintptr_t lo = (uintptr_t)g_heap_start;
+    if (p < lo + HDR || p >= (uintptr_t)g_heap_end || (p % 16u) != 0) {
+        if (!quiet) write_str("my_free: invalid pointer\n");
+        return NULL;
+    }
+
+    block_t *b = header(ptr);
+    if (b->magic != MAGIC) {
+        if (!quiet) write_str("my_free: invalid pointer\n");
+        return NULL;
+    }
+    if (b->free) {
+        if (!quiet) write_str("my_free: double free detected\n");
+        return NULL;
+    }
+    return b;
+}
+
 /* grow(): obtain memory from sbrk, append one new free block. */
 static block_t *grow(size_t need)
 {
@@ -148,7 +183,6 @@ void *my_malloc(size_t size)
     return payload(b);
 }
 
-/* coalesce_all(): single pass; merge physically adjacent free blocks. */
 static void coalesce_all(void)
 {
     block_t *b = g_head;
@@ -164,7 +198,6 @@ static void coalesce_all(void)
             n->free  = 0;
             if (g_tail == n)
                 g_tail = b;
-            /* do not advance b: try to merge with the new b->next */
         } else {
             b = b->next;
         }
@@ -175,29 +208,9 @@ void my_free(void *ptr)
 {
     if (ptr == NULL)
         return;
-
-    if (g_heap_start == NULL) {
-        write_str("my_free: invalid pointer\n");
+    block_t *b = validate_ptr(ptr, 0);
+    if (b == NULL)
         return;
-    }
-
-    uintptr_t p  = (uintptr_t)ptr;
-    uintptr_t lo = (uintptr_t)g_heap_start;
-    if (p < lo + HDR || p >= (uintptr_t)g_heap_end || (p % 16u) != 0) {
-        write_str("my_free: invalid pointer\n");
-        return;
-    }
-
-    block_t *b = header(ptr);
-    if (b->magic != MAGIC) {
-        write_str("my_free: invalid pointer\n");
-        return;
-    }
-    if (b->free) {
-        write_str("my_free: double free detected\n");
-        return;
-    }
-
     b->free = 1;
     coalesce_all();
 }
