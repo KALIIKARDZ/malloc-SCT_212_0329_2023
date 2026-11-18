@@ -1,36 +1,38 @@
 #define _DEFAULT_SOURCE
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>      /* snprintf only: no printf/puts/perror anywhere */
 #include <string.h>
 #include <unistd.h>
 #include "myalloc.h"
 
-#define MAGIC 0x4D59414C   /* 'MYAL' */
+#define MAGIC     0x4D59414C
+#define MIN_CHUNK ((size_t)64 * 1024)
 
 typedef struct block {
-    size_t        size;
-    struct block *next;
-    int           free;
-    int           magic;
-    size_t        pad;
+    size_t        size;     /* payload size in bytes */
+    struct block *next;     /* next block, in increasing address */
+    int           free;     /* 1 = free, 0 = in use */
+    int           magic;    /* MAGIC for every valid block */
+    size_t        pad;      /* explicit padding */
 } block_t;
 
-#define HDR       (((size_t)sizeof(block_t) + 15u) & ~(size_t)15u)
-#define MIN_SPLIT (HDR + 16)
-#define MIN_CHUNK (64u * 1024u)
+#define HDR ((size_t)((sizeof(block_t) + 15) & ~(size_t)15))
 
 _Static_assert(HDR % 16 == 0, "HDR must be a multiple of 16");
 
-static block_t      *g_head       = NULL;
-static block_t      *g_tail       = NULL;
-static char         *g_heap_start = NULL;
-static char         *g_heap_end   = NULL;
-static size_t        g_heap_bytes = 0;
-static fit_policy_t  g_policy     = FIT_FIRST;
+static block_t     *g_head       = NULL;
+static block_t     *g_tail       = NULL;
+static char        *g_heap_start = NULL;   /* first block's header */
+static char        *g_heap_end   = NULL;   /* end of last block's payload */
+static size_t       g_heap_bytes = 0;      /* total bytes ever from sbrk */
+static fit_policy_t g_policy     = FIT_FIRST;
+
+/* ---------- helpers ---------- */
 
 static size_t align_up(size_t n)
 {
-    return (n + 15u) & ~(size_t)15u;
+    return (n + 15) & ~(size_t)15;
 }
 
 static void *payload(block_t *b)
@@ -43,68 +45,37 @@ static block_t *header(void *ptr)
     return (block_t *)((char *)ptr - HDR);
 }
 
-static void write_str(const char *s)
+static void write_err(const char *s)
 {
-    size_t len = 0;
-    while (s[len]) len++;
-    ssize_t r = write(2, s, len);
+    ssize_t r = write(2, s, strlen(s));
     (void)r;
 }
 
-static block_t *validate_ptr(void *ptr, int quiet)
-{
-    if (g_heap_start == NULL) {
-        if (!quiet) write_str("my_free: invalid pointer\n");
-        return NULL;
-    }
-
-    uintptr_t p  = (uintptr_t)ptr;
-    uintptr_t lo = (uintptr_t)g_heap_start;
-    if (p < lo + HDR || p >= (uintptr_t)g_heap_end || (p % 16u) != 0) {
-        if (!quiet) write_str("my_free: invalid pointer\n");
-        return NULL;
-    }
-
-    block_t *b = header(ptr);
-    if (b->magic != MAGIC) {
-        if (!quiet) write_str("my_free: invalid pointer\n");
-        return NULL;
-    }
-    if (b->free) {
-        if (!quiet) write_str("my_free: double free detected\n");
-        return NULL;
-    }
-    return b;
-}
+/* ---------- growing the heap ---------- */
 
 static block_t *grow(size_t need)
 {
-    if (need > (size_t)PTRDIFF_MAX - HDR - MIN_CHUNK - 16u)
+    if (need > (size_t)PTRDIFF_MAX - HDR - MIN_CHUNK - 16)
         return NULL;
 
     size_t want = need + HDR;
     if (want < MIN_CHUNK)
         want = MIN_CHUNK;
+    want = align_up(want);
 
     char *cur = sbrk(0);
     if (cur == (char *)-1)
         return NULL;
 
-    size_t pad = align_up((uintptr_t)cur) - (uintptr_t)cur;
-    if (pad != 0) {
-        if ((size_t)PTRDIFF_MAX - want < pad)
-            return NULL;
-        want += pad;
-    }
+    uintptr_t addr = (uintptr_t)cur;
+    size_t pad = (16 - (addr % 16)) % 16;      /* bytes to reach 16-alignment */
 
-    void *old = sbrk((intptr_t)want);
-    if (old == (void *)-1)
-        return NULL;
-    if (old != cur)
+    char *old = sbrk((intptr_t)(pad + want));
+    if (old == (char *)-1 || old != cur)
         return NULL;
 
-    block_t *b = (block_t *)((char *)old + pad);
-    b->size  = want - pad - HDR;
+    block_t *b = (block_t *)(old + pad);
+    b->size  = want - HDR;
     b->next  = NULL;
     b->free  = 1;
     b->magic = MAGIC;
@@ -113,18 +84,21 @@ static block_t *grow(size_t need)
     if (g_head == NULL) {
         g_head = b;
         g_tail = b;
-        g_heap_start = (char *)b;
     } else {
         g_tail->next = b;
-        g_tail       = b;
+        g_tail = b;
     }
-    g_heap_end   = (char *)b + HDR + b->size;
-    g_heap_bytes += want;
+
+    if (g_heap_start == NULL)
+        g_heap_start = (char *)b;
+    g_heap_end    = (char *)b + HDR + b->size;
+    g_heap_bytes += pad + want;
 
     return b;
 }
 
-/* find_fit(): first-fit or best-fit depending on g_policy. */
+/* ---------- placement ---------- */
+
 static block_t *find_fit(size_t need)
 {
     if (g_policy == FIT_FIRST) {
@@ -135,21 +109,23 @@ static block_t *find_fit(size_t need)
         return NULL;
     }
 
-    /* FIT_BEST: smallest free block that fits; ties go to earlier block. */
-    block_t *best = NULL;
+    block_t *best = NULL;                      /* FIT_BEST */
     for (block_t *b = g_head; b != NULL; b = b->next) {
         if (b->free && b->size >= need) {
             if (best == NULL || b->size < best->size)
                 best = b;
+            if (b->size == need)
+                break;                         /* exact fit: cannot do better */
         }
     }
     return best;
 }
 
+/* Cut b so its payload is exactly need bytes; the rest becomes a free block. */
 static void split_block(block_t *b, size_t need)
 {
-    if (b->size - need < MIN_SPLIT)
-        return;
+    if (b->size - need < HDR + 16)
+        return;                                /* remainder too small: keep whole */
 
     block_t *rest = (block_t *)((char *)payload(b) + need);
     rest->size  = b->size - need - HDR;
@@ -165,11 +141,66 @@ static void split_block(block_t *b, size_t need)
         g_tail = rest;
 }
 
+/* Merge every run of physically adjacent free blocks. */
+static void coalesce_all(void)
+{
+    block_t *b = g_head;
+    while (b != NULL && b->next != NULL) {
+        block_t *n = b->next;
+        int adjacent = ((char *)payload(b) + b->size == (char *)n);
+
+        if (b->free && n->free && adjacent) {
+            b->size += HDR + n->size;
+            b->next  = n->next;
+            n->magic = 0;                      /* stale pointers now invalid */
+            n->size  = 0;
+            n->next  = NULL;
+            n->free  = 0;
+            if (g_tail == n)
+                g_tail = b;
+            /* stay on b: it may merge with the next one too */
+        } else {
+            b = b->next;
+        }
+    }
+}
+
+/* Return the header for a valid, in-use pointer, else NULL.
+ * quiet = 0 prints the error message, quiet = 1 stays silent. */
+static block_t *validate_ptr(void *ptr, int quiet)
+{
+    uintptr_t p = (uintptr_t)ptr;
+
+    if (g_heap_start == NULL
+        || p < (uintptr_t)g_heap_start + HDR
+        || p >= (uintptr_t)g_heap_end
+        || p % 16 != 0) {
+        if (!quiet)
+            write_err("my_free: invalid pointer\n");
+        return NULL;
+    }
+
+    block_t *b = header(ptr);
+    if (b->magic != MAGIC) {
+        if (!quiet)
+            write_err("my_free: invalid pointer\n");
+        return NULL;
+    }
+    if (b->free) {
+        if (!quiet)
+            write_err("my_free: double free detected\n");
+        return NULL;
+    }
+    return b;
+}
+
+/* ---------- public API ---------- */
+
 void *my_malloc(size_t size)
 {
     if (size == 0)
         return NULL;
-    if (size > SIZE_MAX - 15u)
+    if (size > SIZE_MAX - 15)
         return NULL;
 
     size_t need = align_up(size);
@@ -186,34 +217,15 @@ void *my_malloc(size_t size)
     return payload(b);
 }
 
-static void coalesce_all(void)
-{
-    block_t *b = g_head;
-    while (b != NULL && b->next != NULL) {
-        block_t *n = b->next;
-        int adjacent = ((char *)payload(b) + b->size == (char *)n);
-        if (b->free && n->free && adjacent) {
-            b->size += HDR + n->size;
-            b->next  = n->next;
-            n->magic = 0;
-            n->size  = 0;
-            n->next  = NULL;
-            n->free  = 0;
-            if (g_tail == n)
-                g_tail = b;
-        } else {
-            b = b->next;
-        }
-    }
-}
-
 void my_free(void *ptr)
 {
     if (ptr == NULL)
         return;
+
     block_t *b = validate_ptr(ptr, 0);
     if (b == NULL)
         return;
+
     b->free = 1;
     coalesce_all();
 }
@@ -222,7 +234,7 @@ void *my_calloc(size_t nmemb, size_t size)
 {
     if (nmemb == 0 || size == 0)
         return NULL;
-    if (nmemb > SIZE_MAX / size)
+    if (nmemb > SIZE_MAX / size)               /* multiplication would overflow */
         return NULL;
 
     size_t total = nmemb * size;
@@ -243,27 +255,26 @@ void *my_realloc(void *ptr, size_t size)
         return NULL;
     }
 
-    if (size > SIZE_MAX - 15u)
-        return NULL;
-
     block_t *b = validate_ptr(ptr, 1);
     if (b == NULL)
+        return NULL;
+    if (size > SIZE_MAX - 15)
         return NULL;
 
     size_t need = align_up(size);
 
+    /* Case A: already big enough */
     if (b->size >= need) {
         split_block(b, need);
         coalesce_all();
         return ptr;
     }
 
-    if (b->next != NULL
-        && b->next->free
-        && (char *)payload(b) + b->size == (char *)b->next
-        && b->size + HDR + b->next->size >= need)
-    {
-        block_t *n = b->next;
+    /* Case B: next block is free, physically adjacent, and big enough */
+    block_t *n = b->next;
+    if (n != NULL && n->free
+        && (char *)payload(b) + b->size == (char *)n
+        && b->size + HDR + n->size >= need) {
         b->size += HDR + n->size;
         b->next  = n->next;
         n->magic = 0;
@@ -277,45 +288,58 @@ void *my_realloc(void *ptr, size_t size)
         return ptr;
     }
 
+    /* Case C: allocate new, copy, free old (copy BEFORE free) */
     void *np = my_malloc(size);
     if (np == NULL)
         return NULL;
-    size_t copy = b->size;
+    size_t copy = b->size < size ? b->size : size;
     memcpy(np, ptr, copy);
     my_free(ptr);
     return np;
 }
+
+/* ---------- statistics and debugging ---------- */
 
 void heap_stats(heap_stats_t *out)
 {
     if (out == NULL)
         return;
 
-    size_t used = 0, fr = 0, blocks = 0, free_blocks = 0, largest = 0;
+    out->heap_bytes   = g_heap_bytes;
+    out->used_bytes   = 0;
+    out->free_bytes   = 0;
+    out->blocks       = 0;
+    out->free_blocks  = 0;
+    out->largest_free = 0;
 
     for (block_t *b = g_head; b != NULL; b = b->next) {
-        blocks++;
+        out->blocks++;
         if (b->free) {
-            free_blocks++;
-            fr += b->size;
-            if (b->size > largest)
-                largest = b->size;
+            out->free_blocks++;
+            out->free_bytes += b->size;
+            if (b->size > out->largest_free)
+                out->largest_free = b->size;
         } else {
-            used += b->size;
+            out->used_bytes += b->size;
         }
     }
-
-    out->heap_bytes   = g_heap_bytes;
-    out->used_bytes   = used;
-    out->free_bytes   = fr;
-    out->blocks       = blocks;
-    out->free_blocks  = free_blocks;
-    out->largest_free = largest;
 }
 
 void heap_dump(void)
 {
-    /* populated in Task 7b */
+    char buf[160];
+    int idx = 0;
+
+    for (block_t *b = g_head; b != NULL; b = b->next, idx++) {
+        int n = snprintf(buf, sizeof buf, "[%2d] %p size=%zu %s\n",
+                         idx, (void *)b, b->size,
+                         b->free ? "FREE" : "USED");
+        if (n > 0) {
+            size_t w = ((size_t)n < sizeof buf) ? (size_t)n : sizeof buf - 1;
+            ssize_t r = write(1, buf, w);
+            (void)r;
+        }
+    }
 }
 
 void set_policy(fit_policy_t p)
@@ -325,9 +349,21 @@ void set_policy(fit_policy_t p)
 
 int heap_check(void)
 {
-    (void)g_head;
-    (void)g_tail;
-    (void)g_heap_start;
-    (void)g_heap_end;
+    block_t *prev = NULL;
+
+    for (block_t *b = g_head; b != NULL; b = b->next) {
+        if (b->magic != MAGIC)                         /* rule 1: valid header */
+            return 0;
+        if ((uintptr_t)payload(b) % 16u != 0)          /* rule 2: aligned payload */
+            return 0;
+        if (prev != NULL) {
+            char *prev_end = (char *)payload(prev) + prev->size;
+            if ((char *)b < prev_end)                  /* rule 3: increasing order */
+                return 0;
+            if (prev->free && b->free && prev_end == (char *)b)
+                return 0;                              /* rule 4: unmerged neighbors */
+        }
+        prev = b;
+    }
     return 1;
 }
