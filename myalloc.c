@@ -43,18 +43,9 @@ static block_t *header(void *ptr)
     return (block_t *)((char *)ptr - HDR);
 }
 
-/*
- * grow() -- obtain at least `need` payload bytes from sbrk() and append
- * one new free block to the end of the list.
- *
- * `need` is assumed already 16-byte aligned (my_malloc aligns it).
- *
- * Returns the new block, or NULL on overflow / sbrk failure.
- * Silent on failure: stdio is forbidden inside the allocator.
- */
+/* grow(): obtain memory from sbrk, append one new free block. */
 static block_t *grow(size_t need)
 {
-    /* Reject sizes that overflow want, align_up, or sbrk's intptr_t. */
     if (need > (size_t)PTRDIFF_MAX - HDR - MIN_CHUNK - 16u)
         return NULL;
 
@@ -62,7 +53,6 @@ static block_t *grow(size_t need)
     if (want < MIN_CHUNK)
         want = MIN_CHUNK;
 
-    /* Current break; we add alignment padding so the header lands on 16. */
     char *cur = sbrk(0);
     if (cur == (char *)-1)
         return NULL;
@@ -77,11 +67,11 @@ static block_t *grow(size_t need)
     void *old = sbrk((intptr_t)want);
     if (old == (void *)-1)
         return NULL;
-    if (old != cur)                 /* defensive: glibc interposition? */
+    if (old != cur)
         return NULL;
 
     block_t *b = (block_t *)((char *)old + pad);
-    b->size  = want - pad - HDR;    /* payload bytes actually available */
+    b->size  = want - pad - HDR;
     b->next  = NULL;
     b->free  = 1;
     b->magic = MAGIC;
@@ -101,16 +91,39 @@ static block_t *grow(size_t need)
     return b;
 }
 
-/* ---- stubs for Tasks 3-7 ---- */
+/* find_fit(): first free block with size >= need, or NULL. */
+static block_t *find_fit(size_t need)
+{
+    for (block_t *b = g_head; b != NULL; b = b->next) {
+        if (b->free && b->size >= need)
+            return b;
+    }
+    return NULL;
+}
+
+/* ---- Task 3: my_malloc with first-fit ---- */
 
 void *my_malloc(size_t size)
 {
     if (size == 0)
         return NULL;
+    if (size > SIZE_MAX - 15u)
+        return NULL;
+
     size_t need = align_up(size);
-    (void)need;
-    return NULL;
+
+    block_t *b = find_fit(need);
+    if (b == NULL) {
+        b = grow(need);
+        if (b == NULL)
+            return NULL;
+    }
+
+    b->free = 0;
+    return payload(b);
 }
+
+/* ---- Tasks 5-7 stubs ---- */
 
 void my_free(void *ptr)
 {
@@ -146,8 +159,7 @@ void heap_stats(heap_stats_t *out)
 
 void heap_dump(void)
 {
-    (void)payload;
-    (void)grow;    /* temporary: grow() is static and not yet called by my_malloc */
+    /* populated in Task 7 */
 }
 
 void set_policy(fit_policy_t p)
